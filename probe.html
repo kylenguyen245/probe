@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wealthica probe</title>
+<style>
+  :root { --ink:#111; --dim:#777; --line:#ddd; --ok:#0a7; --bad:#c33; --bg:#fff; }
+  * { box-sizing:border-box; }
+  body { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin:0; padding:16px;
+         color:var(--ink); background:var(--bg); }
+  h1 { font-size:14px; margin:0 0 4px; letter-spacing:.08em; text-transform:uppercase; }
+  .status { color:var(--dim); margin-bottom:12px; }
+  .status.ready { color:var(--ok); }
+  .status.err { color:var(--bad); }
+  button { font:inherit; padding:6px 10px; margin:0 6px 6px 0; border:1px solid var(--ink);
+           background:var(--bg); cursor:pointer; }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  #verdict { border:1px solid var(--line); padding:12px; margin:12px 0; white-space:pre-wrap; }
+  #verdict.hit { border-color:var(--ok); }
+  #verdict.miss { border-color:var(--bad); }
+  pre { border:1px solid var(--line); padding:10px; overflow:auto; max-height:60vh;
+        white-space:pre-wrap; word-break:break-word; }
+  .k { color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>Wealthica add-on probe</h1>
+<div class="status" id="status">Waiting for dashboard handshake...</div>
+
+<div>
+  <button id="btnTx" disabled>Fetch transactions</button>
+  <button id="btnPos" disabled>Fetch positions</button>
+  <button id="btnInst" disabled>Fetch institutions</button>
+  <button id="btnCopy" disabled>Copy JSON</button>
+  <button id="btnPost" disabled>POST to backend</button>
+</div>
+
+<div id="verdict">No data yet.</div>
+<pre id="out">// raw JSON appears here</pre>
+
+<!-- If unpkg 404s: npm install @wealthica/wealthica.js and vendor dist/addon.min.js next to this file -->
+<script src="https://unpkg.com/@wealthica/wealthica.js/dist/addon.min.js"></script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var last = null;
+  var INGEST_URL = "http://localhost:8000/api/ingest"; // change when backend is up
+
+  function status(msg, cls) { $("status").textContent = msg; $("status").className = "status " + (cls || ""); }
+  function dump(obj) {
+    last = obj;
+    $("out").textContent = JSON.stringify(obj, null, 2);
+    $("btnCopy").disabled = false;
+    $("btnPost").disabled = false;
+  }
+
+  // ---- the actual question: do options appear, and with what fields? ----
+  var OPT_KEYS = ["option", "strike", "expiry", "expiration", "expiry_date", "contract",
+                  "put", "call", "right", "option_type", "underlying", "multiplier"];
+
+  function walkKeys(o, found, depth) {
+    if (!o || typeof o !== "object" || depth > 6) return;
+    Object.keys(o).forEach(function (k) {
+      var lk = k.toLowerCase();
+      OPT_KEYS.forEach(function (t) { if (lk.indexOf(t) !== -1) found[k] = (found[k] || 0) + 1; });
+      walkKeys(o[k], found, depth + 1);
+    });
+  }
+
+  function looksLikeOption(rec) {
+    var s = JSON.stringify(rec).toLowerCase();
+    if (/\d{6}[cp]\d{8}/.test(s)) return true;                    // OCC symbol
+    if (/"(strike|expiry|expiration)"/.test(s)) return true;
+    if (/\b(call|put)\b/.test(s) && /strike|expir/.test(s)) return true;
+    return false;
+  }
+
+  function analyze(label, arr) {
+    if (!Array.isArray(arr)) { $("verdict").textContent = label + ": response is not an array. Inspect raw JSON."; return; }
+    var types = {}, symbols = {}, optKeys = {}, optRecs = [];
+    arr.forEach(function (r) {
+      var t = r.type || r.transaction_type || "(no type field)";
+      types[t] = (types[t] || 0) + 1;
+      var sym = r.symbol || (r.security && r.security.symbol) || (r.investment && r.investment.symbol) || "(none)";
+      symbols[sym] = (symbols[sym] || 0) + 1;
+      walkKeys(r, optKeys, 0);
+      if (looksLikeOption(r)) optRecs.push(r);
+    });
+
+    var lines = [];
+    lines.push(label + ": " + arr.length + " records");
+    lines.push("");
+    lines.push("distinct type values (this is what the mapper switches on):");
+    Object.keys(types).sort().forEach(function (t) { lines.push("  " + t + "  x" + types[t]); });
+    lines.push("");
+    lines.push("option-ish keys seen anywhere in payload:");
+    var ok = Object.keys(optKeys);
+    lines.push(ok.length ? "  " + ok.join(", ") : "  NONE");
+    lines.push("");
+    lines.push("records matching option heuristics: " + optRecs.length);
+    if (optRecs.length) {
+      lines.push("");
+      lines.push("first option-ish record:");
+      lines.push(JSON.stringify(optRecs[0], null, 2));
+    }
+    lines.push("");
+    lines.push("distinct symbols (first 40):");
+    Object.keys(symbols).slice(0, 40).forEach(function (s) { lines.push("  " + s); });
+
+    $("verdict").textContent = lines.join("\n");
+    $("verdict").className = optRecs.length ? "hit" : "miss";
+  }
+
+  var addon = new Addon(); // no id: required for Developer Add-on
+
+  addon.on("init", function (options) {
+    status("Connected. Filters: " + JSON.stringify(options), "ready");
+    ["btnTx", "btnPos", "btnInst"].forEach(function (b) { $(b).disabled = false; });
+  });
+
+  addon.on("update", function (options) { status("Filters updated: " + JSON.stringify(options), "ready"); });
+  addon.on("reload", function () { status("Dashboard says reload.", "ready"); });
+
+  $("btnTx").onclick = function () {
+    status("Fetching transactions...");
+    addon.api.getTransactions({})
+      .then(function (r) { dump(r); analyze("transactions", r); status("Transactions loaded.", "ready"); })
+      .catch(function (e) { status("getTransactions failed: " + e, "err"); dump(e); });
+  };
+
+  $("btnPos").onclick = function () {
+    status("Fetching positions...");
+    addon.api.getPositions({})
+      .then(function (r) { dump(r); analyze("positions", r); status("Positions loaded.", "ready"); })
+      .catch(function (e) { status("getPositions failed: " + e, "err"); dump(e); });
+  };
+
+  $("btnInst").onclick = function () {
+    status("Fetching institutions...");
+    addon.api.getInstitutions({})
+      .then(function (r) { dump(r); $("verdict").textContent = "institutions: " + (r.length || 0) + " records. Grab the ids for filtering."; status("Institutions loaded.", "ready"); })
+      .catch(function (e) { status("getInstitutions failed: " + e, "err"); dump(e); });
+  };
+
+  $("btnCopy").onclick = function () {
+    navigator.clipboard.writeText(JSON.stringify(last, null, 2))
+      .then(function () { status("Copied. Paste into Claude Code.", "ready"); });
+  };
+
+  $("btnPost").onclick = function () {
+    fetch(INGEST_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(last)
+    }).then(function (r) { status("POSTed to backend: " + r.status, r.ok ? "ready" : "err"); })
+      .catch(function (e) { status("POST failed: " + e + " (CORS or backend down)", "err"); });
+  };
+})();
+</script>
+</body>
+</html>
