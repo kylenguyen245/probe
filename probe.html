@@ -30,9 +30,9 @@
 
 <div>
   <button id="btnTx" disabled>Fetch transactions</button>
-  <button id="btnTxAll" disabled>Fetch ALL transactions (full history)</button>
   <button id="btnPos" disabled>Fetch positions</button>
   <button id="btnInst" disabled>Fetch institutions</button>
+  <button id="btnHist" disabled>Fetch history</button>
   <button id="btnCopy" disabled>Copy JSON</button>
   <button id="btnSave" disabled>Download JSON</button>
   <button id="btnPost" disabled>POST to backend</button>
@@ -93,11 +93,6 @@
 
     var lines = [];
     lines.push(label + ": " + arr.length + " records");
-    var dates = arr.map(function (r) { return r.date; }).filter(Boolean).sort();
-    if (dates.length) {
-      lines.push("date coverage: " + dates[0].slice(0, 10) + " to " + dates[dates.length - 1].slice(0, 10)
-                 + "  <- verify this reaches your first-ever transaction");
-    }
     lines.push("");
     lines.push("distinct type values (this is what the mapper switches on):");
     Object.keys(types).sort().forEach(function (t) { lines.push("  " + t + "  x" + types[t]); });
@@ -124,25 +119,17 @@
 
   addon.on("init", function (options) {
     status("Connected. Filters: " + JSON.stringify(options), "ready");
-    ["btnTx", "btnTxAll", "btnPos", "btnInst"].forEach(function (b) { $(b).disabled = false; });
+    ["btnTx", "btnPos", "btnInst", "btnHist"].forEach(function (b) { $(b).disabled = false; });
   });
 
   addon.on("update", function (options) { status("Filters updated: " + JSON.stringify(options), "ready"); });
   addon.on("reload", function () { status("Dashboard says reload.", "ready"); });
 
   $("btnTx").onclick = function () {
-    status("Fetching transactions (dashboard's current date filter)...");
+    status("Fetching transactions...");
     addon.api.getTransactions({})
-      .then(function (r) { dump(r); analyze("transactions", r); status("Transactions loaded. Check date coverage in the verdict.", "ready"); })
+      .then(function (r) { dump(r); analyze("transactions", r); status("Transactions loaded.", "ready"); })
       .catch(function (e) { status("getTransactions failed: " + e, "err"); dump(e); });
-  };
-
-  $("btnTxAll").onclick = function () {
-    var today = new Date().toISOString().slice(0, 10);
-    status("Fetching FULL transaction history (from 2010-01-01)...");
-    addon.api.getTransactions({ from: "2010-01-01", to: today })
-      .then(function (r) { dump(r); analyze("transactions (full)", r); status("Full history loaded. Verify date coverage reaches your first-ever transaction; if not, set the Wealthica dashboard timeframe to All/Max and retry.", "ready"); })
-      .catch(function (e) { status("full-history fetch failed: " + e + ". Set the dashboard timeframe filter to All/Max and use the normal Fetch button instead.", "err"); dump(e); });
   };
 
   $("btnPos").onclick = function () {
@@ -150,6 +137,52 @@
     addon.api.getPositions({})
       .then(function (r) { dump(r); analyze("positions", r); status("Positions loaded.", "ready"); })
       .catch(function (e) { status("getPositions failed: " + e, "err"); dump(e); });
+  };
+
+  // ---- history spike: the dashboard renders a daily net-worth chart, so a
+  // series exists server-side. Try likely endpoints via addon.request() and
+  // dump whatever answers. Copy/Download captures ALL responses.
+  var HIST_ENDPOINTS = [
+    { endpoint: "history", query: { from: "2019-08-01" } },
+    { endpoint: "history", query: {} },
+    { endpoint: "institutions/history", query: { from: "2019-08-01" } },
+    { endpoint: "assets/history", query: { from: "2019-08-01" } },
+    { endpoint: "liabilities/history", query: { from: "2019-08-01" } },
+    { endpoint: "positions/history", query: { from: "2019-08-01" } },
+    { endpoint: "reports", query: {} },
+    { endpoint: "currencies", query: {} },
+    { endpoint: "currencies/history", query: { from: "2019-08-01" } }
+  ];
+
+  $("btnHist").onclick = function () {
+    status("Probing history endpoints (" + HIST_ENDPOINTS.length + ")...");
+    var results = {};
+    var lines = ["history endpoint sweep:", ""];
+    var chain = Promise.resolve();
+    HIST_ENDPOINTS.forEach(function (spec) {
+      var key = spec.endpoint + (spec.query.from ? "?from=" + spec.query.from : "");
+      chain = chain.then(function () {
+        return addon.request({ method: "GET", endpoint: spec.endpoint, query: spec.query })
+          .then(function (r) {
+            results[key] = r;
+            var desc = Array.isArray(r) ? r.length + " records"
+              : (r && typeof r === "object") ? "object keys: " + Object.keys(r).join(",").slice(0, 120)
+              : String(r).slice(0, 80);
+            lines.push("  HIT  " + key + " -> " + desc);
+          })
+          .catch(function (e) {
+            results[key] = { __error: String(e && e.message ? e.message : e) };
+            lines.push("  miss " + key + " -> " + results[key].__error.slice(0, 100));
+          });
+      });
+    });
+    chain.then(function () {
+      dump(results);
+      var hits = lines.filter(function (l) { return l.indexOf("HIT") === 2; }).length;
+      $("verdict").textContent = lines.join("\n");
+      $("verdict").className = hits ? "hit" : "miss";
+      status("History sweep done: " + hits + "/" + HIST_ENDPOINTS.length + " endpoints answered. Copy JSON and report back.", "ready");
+    });
   };
 
   $("btnInst").onclick = function () {
