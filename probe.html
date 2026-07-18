@@ -30,6 +30,7 @@
 
 <div>
   <button id="btnTx" disabled>Fetch transactions</button>
+  <button id="btnTxAll" disabled>Fetch ALL transactions (full history)</button>
   <button id="btnPos" disabled>Fetch positions</button>
   <button id="btnInst" disabled>Fetch institutions</button>
   <button id="btnCopy" disabled>Copy JSON</button>
@@ -92,6 +93,11 @@
 
     var lines = [];
     lines.push(label + ": " + arr.length + " records");
+    var dates = arr.map(function (r) { return r.date; }).filter(Boolean).sort();
+    if (dates.length) {
+      lines.push("date coverage: " + dates[0].slice(0, 10) + " to " + dates[dates.length - 1].slice(0, 10)
+                 + "  <- verify this reaches your first-ever transaction");
+    }
     lines.push("");
     lines.push("distinct type values (this is what the mapper switches on):");
     Object.keys(types).sort().forEach(function (t) { lines.push("  " + t + "  x" + types[t]); });
@@ -118,17 +124,25 @@
 
   addon.on("init", function (options) {
     status("Connected. Filters: " + JSON.stringify(options), "ready");
-    ["btnTx", "btnPos", "btnInst"].forEach(function (b) { $(b).disabled = false; });
+    ["btnTx", "btnTxAll", "btnPos", "btnInst"].forEach(function (b) { $(b).disabled = false; });
   });
 
   addon.on("update", function (options) { status("Filters updated: " + JSON.stringify(options), "ready"); });
   addon.on("reload", function () { status("Dashboard says reload.", "ready"); });
 
   $("btnTx").onclick = function () {
-    status("Fetching transactions...");
+    status("Fetching transactions (dashboard's current date filter)...");
     addon.api.getTransactions({})
-      .then(function (r) { dump(r); analyze("transactions", r); status("Transactions loaded.", "ready"); })
+      .then(function (r) { dump(r); analyze("transactions", r); status("Transactions loaded. Check date coverage in the verdict.", "ready"); })
       .catch(function (e) { status("getTransactions failed: " + e, "err"); dump(e); });
+  };
+
+  $("btnTxAll").onclick = function () {
+    var today = new Date().toISOString().slice(0, 10);
+    status("Fetching FULL transaction history (from 2010-01-01)...");
+    addon.api.getTransactions({ from: "2010-01-01", to: today })
+      .then(function (r) { dump(r); analyze("transactions (full)", r); status("Full history loaded. Verify date coverage reaches your first-ever transaction; if not, set the Wealthica dashboard timeframe to All/Max and retry.", "ready"); })
+      .catch(function (e) { status("full-history fetch failed: " + e + ". Set the dashboard timeframe filter to All/Max and use the normal Fetch button instead.", "err"); dump(e); });
   };
 
   $("btnPos").onclick = function () {
