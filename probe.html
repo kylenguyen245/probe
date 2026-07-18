@@ -3,30 +3,62 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wealthica probe</title>
+<title>Options tracker sync</title>
 <style>
   :root { --ink:#111; --dim:#777; --line:#ddd; --ok:#0a7; --bad:#c33; --bg:#fff; }
   * { box-sizing:border-box; }
   body { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin:0; padding:16px;
          color:var(--ink); background:var(--bg); }
   h1 { font-size:14px; margin:0 0 4px; letter-spacing:.08em; text-transform:uppercase; }
-  .status { color:var(--dim); margin-bottom:12px; }
+  .status { color:var(--dim); margin-bottom:8px; }
   .status.ready { color:var(--ok); }
   .status.err { color:var(--bad); }
+  .notice { border:2px solid var(--bad); color:var(--bad); padding:10px; margin:10px 0;
+            display:none; white-space:pre-wrap; }
   button { font:inherit; padding:6px 10px; margin:0 6px 6px 0; border:1px solid var(--ink);
            background:var(--bg); cursor:pointer; }
   button:disabled { opacity:.35; cursor:not-allowed; }
+  input { font:inherit; padding:5px 8px; border:1px solid var(--line); width:280px; }
+  label { display:block; margin:6px 0 2px; color:var(--dim); font-size:11px;
+          text-transform:uppercase; letter-spacing:.08em; }
+  fieldset { border:1px solid var(--line); margin:10px 0; padding:10px; }
+  table.sync { border-collapse:collapse; margin:10px 0; }
+  table.sync td, table.sync th { border-bottom:1px solid var(--line); padding:4px 12px;
+                                 text-align:left; font-size:12px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
   #verdict { border:1px solid var(--line); padding:12px; margin:12px 0; white-space:pre-wrap; }
-  #verdict.hit { border-color:var(--ok); }
-  #verdict.miss { border-color:var(--bad); }
-  pre { border:1px solid var(--line); padding:10px; overflow:auto; max-height:60vh;
+  pre { border:1px solid var(--line); padding:10px; overflow:auto; max-height:40vh;
         white-space:pre-wrap; word-break:break-word; }
-  .k { color:var(--dim); }
 </style>
 </head>
 <body>
-<h1>Wealthica add-on probe</h1>
+<h1>Options tracker sync</h1>
 <div class="status" id="status">Waiting for dashboard handshake...</div>
+<div class="notice" id="notice"></div>
+
+<fieldset>
+  <label for="cfgUrl">backend url</label>
+  <input id="cfgUrl" placeholder="http://localhost:8000">
+  <label for="cfgToken">ingest token</label>
+  <input id="cfgToken" type="password" placeholder="INGEST_TOKEN from backend/.env">
+  <div style="margin-top:8px">
+    <button id="btnSaveCfg" disabled>Save config</button>
+    <button id="btnSync" disabled>Sync now</button>
+  </div>
+</fieldset>
+
+<table class="sync" id="syncTable">
+  <thead><tr><th>kind</th><th>fetched</th><th>result</th></tr></thead>
+  <tbody>
+    <tr id="row-transactions"><td>transactions</td><td>-</td><td>-</td></tr>
+    <tr id="row-positions"><td>positions</td><td>-</td><td>-</td></tr>
+    <tr id="row-history"><td>history</td><td>-</td><td>-</td></tr>
+    <tr id="row-institutions"><td>institutions</td><td>-</td><td>-</td></tr>
+  </tbody>
+</table>
+<div class="status" id="lastSync">last sync: never</div>
+<!-- completion marker for the future headless runner -->
+<div id="sync-marker" data-status="idle" data-completed-at=""></div>
 
 <div>
   <button id="btnTx" disabled>Fetch transactions</button>
@@ -35,10 +67,9 @@
   <button id="btnHist" disabled>Fetch history</button>
   <button id="btnCopy" disabled>Copy JSON</button>
   <button id="btnSave" disabled>Download JSON</button>
-  <button id="btnPost" disabled>POST to backend</button>
 </div>
 
-<div id="verdict">No data yet.</div>
+<div id="verdict">Manual fetches land here for inspection.</div>
 <pre id="out">// raw JSON appears here</pre>
 
 <!-- If unpkg 404s: npm install @wealthica/wealthica.js and vendor dist/addon.min.js next to this file -->
@@ -47,150 +78,178 @@
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var last = null;
-  var INGEST_URL = "http://localhost:8000/api/ingest"; // change when backend is up
+  var cfg = { backend_url: "", ingest_token: "" };
+  var SIX_HOURS = 6 * 60 * 60 * 1000;
+  var HISTORY_FROM = "2019-08-01";
+  var syncTimer = null;
 
   function status(msg, cls) { $("status").textContent = msg; $("status").className = "status " + (cls || ""); }
   function dump(obj) {
     last = obj;
-    $("out").textContent = JSON.stringify(obj, null, 2);
+    $("out").textContent = JSON.stringify(obj, null, 2).slice(0, 200000);
     $("btnCopy").disabled = false;
     $("btnSave").disabled = false;
-    $("btnPost").disabled = false;
   }
-
-  // ---- the actual question: do options appear, and with what fields? ----
-  var OPT_KEYS = ["option", "strike", "expiry", "expiration", "expiry_date", "contract",
-                  "put", "call", "right", "option_type", "underlying", "multiplier"];
-
-  function walkKeys(o, found, depth) {
-    if (!o || typeof o !== "object" || depth > 6) return;
-    Object.keys(o).forEach(function (k) {
-      var lk = k.toLowerCase();
-      OPT_KEYS.forEach(function (t) { if (lk.indexOf(t) !== -1) found[k] = (found[k] || 0) + 1; });
-      walkKeys(o[k], found, depth + 1);
-    });
+  function row(kind, fetched, result, cls) {
+    var r = $("row-" + kind);
+    r.cells[1].textContent = fetched;
+    r.cells[2].textContent = result;
+    r.cells[2].className = cls || "";
   }
+  function marker(state) {
+    var m = $("sync-marker");
+    m.setAttribute("data-status", state);
+    m.setAttribute("data-completed-at", new Date().toISOString());
+  }
+  function configured() { return !!(cfg.backend_url && cfg.ingest_token); }
 
-  function looksLikeOption(rec) {
-    var s = JSON.stringify(rec).toLowerCase();
-    if (/\d{6}[cp]\d{8}/.test(s)) return true;                    // OCC symbol
-    if (/"(strike|expiry|expiration)"/.test(s)) return true;
-    if (/\b(call|put)\b/.test(s) && /strike|expir/.test(s)) return true;
+  function mixedContentNotice(err) {
+    if (location.protocol === "https:" && /^http:/.test(cfg.backend_url)) {
+      var n = $("notice");
+      n.style.display = "block";
+      n.textContent =
+        "POST blocked (" + err + ").\n" +
+        "This page is HTTPS and the backend is plain HTTP. Chrome/Edge/Firefox " +
+        "exempt http://localhost; Safari and non-localhost targets are blocked " +
+        "until api.<domain> exists (Phase 6). Fallback: Download JSON and run " +
+        "scripts/ingest_file.py <kind> <file>.";
+      return true;
+    }
     return false;
   }
 
-  function analyze(label, arr) {
-    if (!Array.isArray(arr)) { $("verdict").textContent = label + ": response is not an array. Inspect raw JSON."; return; }
-    var types = {}, symbols = {}, optKeys = {}, optRecs = [];
-    arr.forEach(function (r) {
-      var t = r.type || r.transaction_type || "(no type field)";
-      types[t] = (types[t] || 0) + 1;
-      var sym = r.symbol || (r.security && r.security.symbol) || (r.investment && r.investment.symbol) || "(none)";
-      symbols[sym] = (symbols[sym] || 0) + 1;
-      walkKeys(r, optKeys, 0);
-      if (looksLikeOption(r)) optRecs.push(r);
+  function postKind(kind, payload) {
+    return fetch(cfg.backend_url.replace(/\/$/, "") + "/api/ingest", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + cfg.ingest_token
+      },
+      body: JSON.stringify({ kind: kind, payload: payload })
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) {
+        throw new Error("HTTP " + r.status + " " + t.slice(0, 120));
+      });
+      return r.json();
     });
-
-    var lines = [];
-    lines.push(label + ": " + arr.length + " records");
-    lines.push("");
-    lines.push("distinct type values (this is what the mapper switches on):");
-    Object.keys(types).sort().forEach(function (t) { lines.push("  " + t + "  x" + types[t]); });
-    lines.push("");
-    lines.push("option-ish keys seen anywhere in payload:");
-    var ok = Object.keys(optKeys);
-    lines.push(ok.length ? "  " + ok.join(", ") : "  NONE");
-    lines.push("");
-    lines.push("records matching option heuristics: " + optRecs.length);
-    if (optRecs.length) {
-      lines.push("");
-      lines.push("first option-ish record:");
-      lines.push(JSON.stringify(optRecs[0], null, 2));
-    }
-    lines.push("");
-    lines.push("distinct symbols (first 40):");
-    Object.keys(symbols).slice(0, 40).forEach(function (s) { lines.push("  " + s); });
-
-    $("verdict").textContent = lines.join("\n");
-    $("verdict").className = optRecs.length ? "hit" : "miss";
   }
 
   var addon = new Addon(); // no id: required for Developer Add-on
 
-  addon.on("init", function (options) {
-    status("Connected. Filters: " + JSON.stringify(options), "ready");
-    ["btnTx", "btnPos", "btnInst", "btnHist"].forEach(function (b) { $(b).disabled = false; });
-  });
+  function fetchKind(kind) {
+    if (kind === "transactions") return addon.api.getTransactions({});
+    if (kind === "positions") return addon.api.getPositions({});
+    if (kind === "institutions") return addon.api.getInstitutions({});
+    return addon.request({ method: "GET", endpoint: "history", query: { from: HISTORY_FROM } });
+  }
 
-  addon.on("update", function (options) { status("Filters updated: " + JSON.stringify(options), "ready"); });
-  addon.on("reload", function () { status("Dashboard says reload.", "ready"); });
+  function summarize(res) {
+    var parts = [];
+    ["inserted", "updated_existing", "deduped", "rows", "balance_rows", "accounts_created"]
+      .forEach(function (k) { if (res && res[k] !== undefined && res[k] !== 0) parts.push(k + " " + res[k]); });
+    return parts.join(", ") || "no changes";
+  }
 
-  $("btnTx").onclick = function () {
-    status("Fetching transactions...");
-    addon.api.getTransactions({})
-      .then(function (r) { dump(r); analyze("transactions", r); status("Transactions loaded.", "ready"); })
-      .catch(function (e) { status("getTransactions failed: " + e, "err"); dump(e); });
-  };
+  function nudgeSync(institutions) {
+    (institutions || []).forEach(function (inst) {
+      if (!inst.deleted && inst._id) {
+        try { addon.api.syncInstitution(inst._id); } catch (e) { /* nudge only */ }
+      }
+    });
+  }
 
-  $("btnPos").onclick = function () {
-    status("Fetching positions...");
-    addon.api.getPositions({})
-      .then(function (r) { dump(r); analyze("positions", r); status("Positions loaded.", "ready"); })
-      .catch(function (e) { status("getPositions failed: " + e, "err"); dump(e); });
-  };
-
-  // ---- history spike: the dashboard renders a daily net-worth chart, so a
-  // series exists server-side. Try likely endpoints via addon.request() and
-  // dump whatever answers. Copy/Download captures ALL responses.
-  var HIST_ENDPOINTS = [
-    { endpoint: "history", query: { from: "2019-08-01" } },
-    { endpoint: "history", query: {} },
-    { endpoint: "institutions/history", query: { from: "2019-08-01" } },
-    { endpoint: "assets/history", query: { from: "2019-08-01" } },
-    { endpoint: "liabilities/history", query: { from: "2019-08-01" } },
-    { endpoint: "positions/history", query: { from: "2019-08-01" } },
-    { endpoint: "reports", query: {} },
-    { endpoint: "currencies", query: {} },
-    { endpoint: "currencies/history", query: { from: "2019-08-01" } }
-  ];
-
-  $("btnHist").onclick = function () {
-    status("Probing history endpoints (" + HIST_ENDPOINTS.length + ")...");
-    var results = {};
-    var lines = ["history endpoint sweep:", ""];
-    var chain = Promise.resolve();
-    HIST_ENDPOINTS.forEach(function (spec) {
-      var key = spec.endpoint + (spec.query.from ? "?from=" + spec.query.from : "");
+  function autoSync(trigger) {
+    if (!configured()) { status("Not configured: set backend url + token.", "err"); return; }
+    status("Sync (" + trigger + ") running...");
+    marker("running");
+    $("notice").style.display = "none";
+    var kinds = ["transactions", "positions", "history", "institutions"];
+    var failed = 0;
+    var chain = fetchKind("institutions")
+      .then(function (insts) { nudgeSync(insts); })
+      .catch(function () { /* nudge is best-effort */ });
+    kinds.forEach(function (kind) {
       chain = chain.then(function () {
-        return addon.request({ method: "GET", endpoint: spec.endpoint, query: spec.query })
-          .then(function (r) {
-            results[key] = r;
-            var desc = Array.isArray(r) ? r.length + " records"
-              : (r && typeof r === "object") ? "object keys: " + Object.keys(r).join(",").slice(0, 120)
-              : String(r).slice(0, 80);
-            lines.push("  HIT  " + key + " -> " + desc);
+        row(kind, "fetching...", "-");
+        return fetchKind(kind)
+          .then(function (payload) {
+            var n = Array.isArray(payload) ? payload.length : 0;
+            row(kind, n + " records", "posting...");
+            return postKind(kind, payload)
+              .then(function (res) { row(kind, n + " records", summarize(res), "ok"); })
+              .catch(function (e) {
+                failed++;
+                row(kind, n + " records", String(e.message || e).slice(0, 80), "bad");
+                mixedContentNotice(e.message || e);
+              });
           })
           .catch(function (e) {
-            results[key] = { __error: String(e && e.message ? e.message : e) };
-            lines.push("  miss " + key + " -> " + results[key].__error.slice(0, 100));
+            failed++;
+            row(kind, "fetch failed", String(e.message || e).slice(0, 80), "bad");
           });
       });
     });
     chain.then(function () {
-      dump(results);
-      var hits = lines.filter(function (l) { return l.indexOf("HIT") === 2; }).length;
-      $("verdict").textContent = lines.join("\n");
-      $("verdict").className = hits ? "hit" : "miss";
-      status("History sweep done: " + hits + "/" + HIST_ENDPOINTS.length + " endpoints answered. Copy JSON and report back.", "ready");
+      var ts = new Date().toISOString().replace("T", " ").slice(0, 19) + "Z";
+      $("lastSync").textContent = "last sync: " + ts +
+        (failed ? " (" + failed + " kind(s) FAILED)" : " (all kinds ok)");
+      $("lastSync").className = "status " + (failed ? "err" : "ready");
+      marker(failed ? "error" : "ok");
+      status(failed ? "Sync finished with failures." : "Sync complete.", failed ? "err" : "ready");
     });
+  }
+
+  addon.on("init", function (options) {
+    var data = (options && options.data) || {};
+    cfg.backend_url = data.backend_url || "";
+    cfg.ingest_token = data.ingest_token || "";
+    $("cfgUrl").value = cfg.backend_url || "http://localhost:8000";
+    $("cfgToken").value = cfg.ingest_token;
+    ["btnTx", "btnPos", "btnInst", "btnHist", "btnSaveCfg", "btnSync"]
+      .forEach(function (b) { $(b).disabled = false; });
+    if (configured()) {
+      status("Connected. Auto-sync starting.", "ready");
+      autoSync("init");
+      syncTimer = setInterval(function () { autoSync("6h timer"); }, SIX_HOURS);
+    } else {
+      status("Connected. Enter backend url + ingest token, Save config, then Sync now.", "ready");
+    }
+  });
+
+  addon.on("reload", function () { status("Dashboard says reload.", "ready"); });
+
+  $("btnSaveCfg").onclick = function () {
+    cfg.backend_url = $("cfgUrl").value.trim();
+    cfg.ingest_token = $("cfgToken").value.trim();
+    addon.saveData({ backend_url: cfg.backend_url, ingest_token: cfg.ingest_token })
+      .then(function () {
+        status("Config saved.", "ready");
+        if (configured() && !syncTimer) {
+          syncTimer = setInterval(function () { autoSync("6h timer"); }, SIX_HOURS);
+        }
+      })
+      .catch(function (e) { status("saveData failed: " + e, "err"); });
   };
 
-  $("btnInst").onclick = function () {
-    status("Fetching institutions...");
-    addon.api.getInstitutions({})
-      .then(function (r) { dump(r); $("verdict").textContent = "institutions: " + (r.length || 0) + " records. Grab the ids for filtering."; status("Institutions loaded.", "ready"); })
-      .catch(function (e) { status("getInstitutions failed: " + e, "err"); dump(e); });
-  };
+  $("btnSync").onclick = function () { autoSync("manual"); };
+
+  // ---- manual debugging fetches (dump to inspector, no POST) ----
+  function manualFetch(kind, label) {
+    status("Fetching " + label + "...");
+    fetchKind(kind)
+      .then(function (r) {
+        dump(r);
+        $("verdict").textContent = label + ": " +
+          (Array.isArray(r) ? r.length + " records" : "object") +
+          " (manual fetch, not posted; use Sync now to ingest)";
+        status(label + " loaded.", "ready");
+      })
+      .catch(function (e) { status(label + " failed: " + e, "err"); dump({ error: String(e) }); });
+  }
+  $("btnTx").onclick = function () { manualFetch("transactions", "transactions"); };
+  $("btnPos").onclick = function () { manualFetch("positions", "positions"); };
+  $("btnInst").onclick = function () { manualFetch("institutions", "institutions"); };
+  $("btnHist").onclick = function () { manualFetch("history", "history"); };
 
   function legacyCopy(text) {
     var ta = document.createElement("textarea");
@@ -204,32 +263,19 @@
     return ok;
   }
 
-  function manualCopy(text) {
-    var box = $("manual");
-    if (!box) {
-      box = document.createElement("textarea");
-      box.id = "manual";
-      box.style.cssText = "width:100%;height:30vh;font:inherit;margin-top:8px;";
-      document.body.appendChild(box);
-    }
-    box.value = text;
-    box.focus(); box.select();
-    status("Clipboard blocked by the iframe. JSON is selected below: press Ctrl+C (Cmd+C on Mac).", "err");
-  }
-
   $("btnCopy").onclick = function () {
     var text = JSON.stringify(last, null, 2);
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text)
-        .then(function () { status("Copied. Paste into Claude Code.", "ready"); })
+        .then(function () { status("Copied.", "ready"); })
         .catch(function () {
-          if (legacyCopy(text)) { status("Copied (fallback). Paste into Claude Code.", "ready"); }
-          else { manualCopy(text); }
+          if (legacyCopy(text)) { status("Copied (fallback).", "ready"); }
+          else { status("Clipboard blocked; use Download.", "err"); }
         });
     } else if (legacyCopy(text)) {
-      status("Copied (fallback). Paste into Claude Code.", "ready");
+      status("Copied (fallback).", "ready");
     } else {
-      manualCopy(text);
+      status("Clipboard blocked; use Download.", "err");
     }
   };
 
@@ -242,16 +288,7 @@
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(a.href);
-    status("Downloaded. If the browser blocked it, use Copy instead.", "ready");
-  };
-
-  $("btnPost").onclick = function () {
-    fetch(INGEST_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(last)
-    }).then(function (r) { status("POSTed to backend: " + r.status, r.ok ? "ready" : "err"); })
-      .catch(function (e) { status("POST failed: " + e + " (CORS or backend down)", "err"); });
+    status("Downloaded.", "ready");
   };
 })();
 </script>
